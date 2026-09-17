@@ -14,6 +14,13 @@ import {
   unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
+import { randomUUID } from "node:crypto";
+import { PaseoBackend, type PaseoSubagentRecord } from "./paseo.ts";
+import { registerPaseoBootstrap } from "./paseo-bootstrap.ts";
+import { prepareScopedLaunch } from "./account-launch.mjs";
+import { readAccountSessionMetadata } from "./account-session.mjs";
+import { registerAccountScopeGuard } from "./account-scope-guard.ts";
+import subagentDoneExtension from "./subagent-done.ts";
 import {
   isMuxAvailable,
   muxSetupHint,
@@ -118,7 +125,7 @@ const SubagentParams = Type.Object({
   interactive: Type.Optional(
     Type.Boolean({
       description:
-        "Mark the subagent as interactive (long-running, user drives the conversation in its own pane). When true, the main session is not woken by status transitions (stalled/recovered) for this subagent. If omitted, falls back to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit` (agents that auto-exit are autonomous and get stall pings; agents that don't are interactive and stay quiet).",
+        "Mark the subagent as interactive (long-running, user drives its conversation). When true, the main session is not woken by status transitions (stalled/recovered) for this subagent. If omitted, falls back to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit` (autonomous agents get stall pings; interactive agents stay quiet).",
     }),
   ),
   resumeSessionId: Type.Optional(
@@ -439,11 +446,13 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage" | "paseoAgentId"
   >,
   name: string,
 ): string {
-  const sessionRef = result.sessionFile
+  const sessionRef = result.paseoAgentId
+    ? `\n\nPaseo agent: ${result.paseoAgentId}\nResume with subagent_resume({ agentId: ${JSON.stringify(result.paseoAgentId)} }).`
+    : result.sessionFile
     ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
     : "";
 
@@ -474,6 +483,7 @@ interface SubagentResult {
   task: string;
   summary: string;
   sessionFile?: string;
+  paseoAgentId?: string;
   claudeSessionId?: string;
   exitCode: number;
   elapsed: number;
@@ -513,6 +523,7 @@ interface RunningSubagent {
    * subagent's pane (e.g. planner).
    */
   interactive: boolean;
+  paseoAgentId?: string;
 }
 
 /** All currently running subagents, keyed by id. */
@@ -754,7 +765,8 @@ function resolveInterruptTarget(params: { id?: string; name?: string }):
   | { error: string } {
   const requestedId = params.id?.trim();
   if (requestedId) {
-    const running = runningSubagents.get(requestedId);
+    const running = runningSubagents.get(requestedId)
+      ?? Array.from(runningSubagents.values()).find((entry) => entry.paseoAgentId === requestedId);
     return running ? { running } : { error: `No running subagent with id "${requestedId}".` };
   }
 
@@ -952,7 +964,11 @@ async function launchSubagent(
 
   const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
-  const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
+  const account = await prepareScopedLaunch({ cwd: targetCwdForSession, parentSessionFile: sessionFile });
+  if (account && agentDefs?.cli === "claude") {
+    throw new Error("Scoped account launches support Pi only. The Claude CLI cannot use the selected Pi credential profile.");
+  }
+  const sessionDir = getDefaultSessionDirFor(targetCwdForSession, account?.credentialDir ?? effectiveAgentDir);
 
   // Generate a deterministic session file path for this subagent.
   // This eliminates race conditions when multiple agents launch simultaneously —
@@ -1082,7 +1098,7 @@ async function launchSubagent(
   // ── Pi CLI path ──
 
   // Build pi command
-  const parts: string[] = ["pi"];
+  const parts: string[] = account ? account.command.map(shellEscape) : ["pi"];
   parts.push("--session", shellEscape(subagentSessionFile));
 
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
@@ -1121,7 +1137,9 @@ async function launchSubagent(
 
   // If the target cwd has its own .pi/agent/, use that as the config root.
   // Otherwise propagate the current/global agent dir.
-  if (localAgentDir && existsSync(localAgentDir)) {
+  if (account) {
+    envParts.push(...Object.entries(account.env).map(([key, value]) => `${key}=${shellEscape(value)}`));
+  } else if (localAgentDir && existsSync(localAgentDir)) {
     envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(localAgentDir)}`);
   } else if (process.env.PI_CODING_AGENT_DIR) {
     envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
@@ -1358,9 +1376,194 @@ async function watchSubagent(
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
+  // Session switching can reuse the imported module with a fresh extension
+  // runtime. Its observers need a fresh lifetime after the previous shutdown.
+  if (getModuleAbortSignal().aborted) {
+    (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
+  }
+  registerAccountScopeGuard(pi);
+  registerPaseoBootstrap(pi);
+  if (process.env.PI_SUBAGENT_BACKEND === "paseo") subagentDoneExtension(pi);
+
+  const usePaseo = !!process.env.PASEO_AGENT_ID;
+  const moduleSignal = getModuleAbortSignal();
+  let paseoBackend: Promise<PaseoBackend> | undefined;
+  let paseoSessionId: string | undefined;
+  const pendingDeliveries = new Map<string, {
+    backend: PaseoBackend;
+    record: PaseoSubagentRecord;
+    result: Awaited<ReturnType<PaseoBackend["watch"]>>;
+    acknowledging?: boolean;
+  }>();
+
+  function flushDeliveryAcknowledgements() {
+    if (moduleSignal.aborted) return;
+    const entries = latestCtx?.sessionManager.getEntries() ?? [];
+    for (const [deliveryId, pending] of pendingDeliveries) {
+      if (pending.acknowledging || !entries.some((entry: any) => entry.type === "custom_message" && entry.details?.paseoDeliveryId === deliveryId)) continue;
+      pending.acknowledging = true;
+      void pending.backend.ack(pending.record, pending.result).then(() => {
+        pendingDeliveries.delete(deliveryId);
+      }).catch((error) => {
+        pending.acknowledging = false;
+        latestCtx?.ui.notify(`Could not acknowledge Paseo result: ${error?.message ?? String(error)}`, "warning");
+      });
+    }
+  }
+
+  // Pi persists custom messages after its message_end extension hooks. Wait
+  // until that append has occurred before acknowledging a queued steer result.
+  pi.on("message_end", () => {
+    if (pendingDeliveries.size) setTimeout(flushDeliveryAcknowledgements, 0);
+  });
+
+  async function getPaseoBackend(ctx: ExtensionContext): Promise<PaseoBackend> {
+    const sessionId = ctx.sessionManager.getSessionId();
+    if (!paseoBackend || paseoSessionId !== sessionId) {
+      if (paseoSessionId && paseoSessionId !== sessionId) {
+        pendingDeliveries.clear();
+        for (const [id, running] of runningSubagents) {
+          if (!running.paseoAgentId) continue;
+          running.abortController?.abort();
+          runningSubagents.delete(id);
+        }
+      }
+      if (paseoBackend) void paseoBackend.then((backend) => backend.close()).catch(() => {});
+      paseoSessionId = sessionId;
+      const parentFile = ctx.sessionManager.getSessionFile();
+      const parentAccount = parentFile ? readAccountSessionMetadata(parentFile) : {};
+      paseoBackend = PaseoBackend.create({
+        parentAgentId: process.env.PASEO_AGENT_ID!,
+        parentSessionId: sessionId,
+        parentSessionFile: parentFile ?? undefined,
+        artifactDir: getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId),
+        parentAccountScope: parentAccount.scope,
+        accountPolicyFile: parentAccount.policyFile,
+      });
+      // A failed connection can be retried; it must never fall back to a mux.
+      const pending = paseoBackend;
+      void pending.catch(() => { if (paseoBackend === pending) paseoBackend = undefined; });
+    }
+    return paseoBackend;
+  }
+
+  function watchPaseoRecord(backend: PaseoBackend, record: PaseoSubagentRecord) {
+    if (runningSubagents.has(record.id)) return;
+    const controller = new AbortController();
+    const signal = AbortSignal.any([controller.signal, moduleSignal]);
+    const running: RunningSubagent = {
+      ...record,
+      interactive: record.interactive ?? false,
+      surface: record.agentId,
+      paseoAgentId: record.agentId,
+      abortController: controller,
+      statusState: createStatusState({ source: "pi", startTimeMs: record.startTime }),
+    };
+    runningSubagents.set(record.id, running);
+    startWidgetRefresh();
+    startStatusRefresh(pi);
+    let resultDelivered = false;
+    void backend.watch(record, signal).then(async (result) => {
+      if (signal.aborted) return;
+      const deliveryId = result.deliveryId;
+      const delivered = deliveryId && latestCtx?.sessionManager.getEntries().some((entry: any) =>
+        entry.type === "custom_message" && entry.details?.paseoDeliveryId === deliveryId);
+      if (delivered) { resultDelivered = true; await backend.ack(record, result); return; }
+      if (deliveryId && pendingDeliveries.has(deliveryId)) return;
+      if (deliveryId) pendingDeliveries.set(deliveryId, { backend, record, result });
+      const details = { ...result, agent: record.agent, paseoAgentId: record.agentId, paseoDeliveryId: deliveryId };
+      const sessionRef = `\n\nPaseo agent: ${record.agentId}\nResume with subagent_resume({ agentId: ${JSON.stringify(record.agentId)} }).`;
+      pi.sendMessage({
+        customType: result.ping ? "subagent_ping" : "subagent_result",
+        content: result.ping
+          ? `Sub-agent "${record.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`
+          : resolveResultPresentation({ ...result, paseoAgentId: record.agentId }, record.name),
+        display: true,
+        details: { ...details, name: record.name, ...(result.ping ? { message: result.ping.message } : {}) },
+      }, { triggerTurn: true, deliverAs: "steer" });
+      resultDelivered = true;
+      flushDeliveryAcknowledgements();
+    }).catch((error) => {
+      if (signal.aborted) return;
+      if (resultDelivered) {
+        latestCtx?.ui.notify(`Could not acknowledge Paseo result for "${record.name}": ${error?.message ?? String(error)}`, "warning");
+        return;
+      }
+      pi.sendMessage({
+        customType: "subagent_result",
+        content: `Paseo subagent "${record.name}" could not be observed: ${error?.message ?? String(error)}. The managed agent is retained in Paseo.`,
+        display: true,
+        details: { name: record.name, paseoAgentId: record.agentId, error: String(error) },
+      }, { triggerTurn: true, deliverAs: "steer" });
+    }).finally(() => {
+      if (runningSubagents.get(record.id) === running) runningSubagents.delete(record.id);
+      updateWidget();
+    });
+  }
+
+  async function spawnPaseo(params: Static<typeof SubagentParams>, ctx: ExtensionContext) {
+    const defs = params.agent ? loadAgentDefaults(params.agent) : null;
+    if (defs?.cli && defs.cli !== "pi") throw new Error("Paseo subagents support Pi agent definitions only in this version.");
+    const backend = await getPaseoBackend(ctx);
+    const id = randomUUID();
+    const { effectiveCwd, effectiveAgentDir } = resolveSubagentPaths(params, defs);
+    const cwd = effectiveCwd ?? ctx.cwd;
+    const account = await backend.resolveAccountForCwd(cwd);
+    const selectedAgentDir = account?.credentialDir ?? effectiveAgentDir;
+    const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+    const sessionFile = join(getDefaultSessionDirFor(cwd, selectedAgentDir), `${new Date().toISOString().replace(/[:.]/g, "-")}_${id}.jsonl`);
+    const behavior = resolveLaunchBehavior(params, defs);
+    if (behavior.seededSessionMode) {
+      seedSubagentSessionFile({ mode: behavior.seededSessionMode, parentSessionFile: ctx.sessionManager.getSessionFile()!, childSessionFile: sessionFile, childCwd: cwd });
+    }
+    const activityFile = getSubagentActivityFile(artifactDir, id);
+    const identity = defs?.body ?? params.systemPrompt;
+    const instruction = defs?.autoExit
+      ? "Complete your task autonomously. Your final assistant message should summarize your work."
+      : "Complete your task. When finished, call subagent_done. The user can interact with you in Paseo at any time.";
+    const prompt = behavior.inheritsConversationContext ? params.task : `${defs?.systemPromptMode ? "" : identity ?? ""}\n\n${instruction}\n\n${params.task}`;
+    const record = await backend.spawn({
+      id, name: params.name, task: params.task, agent: params.agent, cwd,
+      model: params.model ?? defs?.model, thinking: defs?.thinking,
+      sessionFile, activityFile, sessionMode: behavior.sessionMode,
+      autoExit: defs?.autoExit ?? false, interactive: resolveEffectiveInteractive(params, defs),
+      configDir: selectedAgentDir, extensionPath: join(SUBAGENTS_DIR, "index.ts"),
+      prompt,
+      bootstrap: {
+        sessionFile: behavior.seededSessionMode ? sessionFile : undefined,
+        tools: buildSubagentToolAllowlist(params.tools ?? defs?.tools)?.split(","),
+        deniedTools: [...resolveDenyTools(defs)],
+        systemPrompt: defs?.systemPromptMode ? identity : undefined,
+        systemPromptMode: defs?.systemPromptMode,
+        skills: (params.skills ?? defs?.skills ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+      },
+    });
+    watchPaseoRecord(backend, record);
+    return {
+      content: [{ type: "text" as const, text: `Sub-agent "${params.name}" launched in Paseo${account ? ` (${account.scope} account)` : ""}. Its result will be delivered automatically; continue other work or end your turn.` }],
+      details: { id: record.id, name: record.name, task: record.task, agent: record.agent, paseoAgentId: record.agentId, sessionFile: record.sessionFile, status: "started", ...(account ? { accountScope: account.scope } : {}) },
+    };
+  }
+
+  moduleSignal.addEventListener("abort", () => {
+    if (paseoBackend) void paseoBackend.then((backend) => backend.close()).catch(() => {});
+  }, { once: true });
+
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
+    if (usePaseo) {
+      // Do not hold up Pi's RPC startup while connecting back to its owner.
+      const sessionId = ctx.sessionManager.getSessionId();
+      void getPaseoBackend(ctx).then(async (backend) => {
+        const records = await backend.restore();
+        if (moduleSignal.aborted || paseoSessionId !== sessionId) return;
+        for (const record of records) watchPaseoRecord(backend, record);
+      }).catch((error: any) => {
+        if (moduleSignal.aborted || paseoSessionId !== sessionId) return;
+        ctx.ui.notify(`Paseo subagent connection failed: ${error?.message ?? String(error)}`, "error");
+      });
+    }
   });
 
   // Clean up on session shutdown
@@ -1399,14 +1602,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent",
       label: "Subagent",
       description:
-        "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
+        "Spawn a sub-agent managed by Paseo when running inside Paseo, or in a dedicated terminal pane otherwise. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
       promptSnippet:
-        "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
+        "Spawn a sub-agent managed by Paseo when running inside Paseo, or in a dedicated terminal pane otherwise. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
@@ -1430,7 +1633,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Validate prerequisites
-        if (!isMuxAvailable()) {
+        if (!usePaseo && !isMuxAvailable()) {
           return muxUnavailableResult();
         }
 
@@ -1445,6 +1648,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             details: { error: "no session file" },
           };
         }
+
+        if (usePaseo) return spawnPaseo(params, ctx);
 
         // Launch the subagent (creates pane, sends command)
         const running = await launchSubagent(params, ctx);
@@ -1603,19 +1808,29 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent_interrupt",
       label: "Interrupt Subagent",
       description:
-        "Send Escape to the active turn of a currently running Pi-backed subagent. " +
-        "The child pane, session, watcher, and running entry remain alive; this returns only a local acknowledgement " +
+        "Interrupt the active turn of a currently running Pi-backed subagent through Paseo or its terminal. " +
+        "The child session, watcher, and running entry remain alive; this returns only an acknowledgement " +
         "and does not emit a subagent_result solely because of this request.",
       promptSnippet:
-        "Send Escape to the active turn of a currently running Pi-backed subagent. " +
-        "The child pane, session, watcher, and running entry remain alive; this returns only a local acknowledgement " +
+        "Interrupt the active turn of a currently running Pi-backed subagent through Paseo or its terminal. " +
+        "The child session, watcher, and running entry remain alive; this returns only an acknowledgement " +
         "and does not emit a subagent_result solely because of this request.",
       parameters: Type.Object({
         id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
         name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
       }),
 
-      async execute(_toolCallId, params) {
+      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        if (usePaseo) {
+          const resolved = resolveInterruptTarget(params);
+          if ("error" in resolved) return { content: [{ type: "text", text: resolved.error }], details: { error: resolved.error } };
+          const running = resolved.running;
+          const backend = await getPaseoBackend(ctx);
+          await backend.interrupt(running.paseoAgentId!);
+          running.statusState = forceStatusAfterInterrupt(running.statusState, Date.now());
+          updateWidget();
+          return { content: [{ type: "text", text: `Interrupt requested for subagent "${running.name}" in Paseo.` }], details: { id: running.id, name: running.name, status: "interrupt_requested" } };
+        }
         return handleSubagentInterrupt(params);
       },
 
@@ -1711,23 +1926,24 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent_resume",
       label: "Resume Subagent",
       description:
-        "Resume a previous sub-agent session in a new multiplexer pane. " +
+        "Resume the same Paseo-managed subagent, or reopen a terminal subagent session. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
         "Use when a sub-agent was cancelled or needs follow-up work.",
       promptSnippet:
-        "Resume a previous sub-agent session in a new multiplexer pane. " +
+        "Resume the same Paseo-managed subagent, or reopen a terminal subagent session. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
         "Use when a sub-agent was cancelled or needs follow-up work.",
       parameters: Type.Object({
-        sessionPath: Type.String({ description: "Path to the session .jsonl file to resume" }),
+        sessionPath: Type.Optional(Type.String({ description: "Path to the session .jsonl file to resume; required outside Paseo" })),
+        agentId: Type.Optional(Type.String({ description: "Paseo agent ID returned by subagent; resumes that same managed child" })),
         name: Type.Optional(
-          Type.String({ description: "Display name for the terminal tab. Default: 'Resume'" }),
+          Type.String({ description: "Display name for the subagent. Paseo keeps the current name by default." }),
         ),
         message: Type.Optional(
           Type.String({
@@ -1772,6 +1988,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        if (usePaseo) {
+          const backend = await getPaseoBackend(ctx);
+          const record = await backend.resume(params);
+          // An interrupted delegation still has an observer. Replace it with
+          // one scoped to this follow-up while retaining the managed agent.
+          const previous = Array.from(runningSubagents.values()).find((running) => running.paseoAgentId === record.agentId);
+          if (previous) {
+            previous.abortController?.abort();
+            runningSubagents.delete(previous.id);
+          }
+          watchPaseoRecord(backend, record);
+          return { content: [{ type: "text", text: `Sub-agent "${record.name}" resumed in Paseo.` }], details: { id: record.id, name: record.name, paseoAgentId: record.agentId, sessionPath: record.sessionFile, status: "started" } };
+        }
+        if (!params.sessionPath) return { content: [{ type: "text", text: "Provide sessionPath to resume a terminal subagent." }], details: { error: "sessionPath required" } };
+        const resumedSessionPath = params.sessionPath;
         const name = params.name ?? "Resume";
         const { autoExit, interactive } = resolveResumeLaunchBehavior(params);
         const startTime = Date.now();
@@ -1791,13 +2022,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Record entry count before resuming so we can extract new messages
+        const account = await prepareScopedLaunch({
+          cwd: ctx.cwd, parentSessionFile: ctx.sessionManager.getSessionFile(), sessionFile: params.sessionPath,
+        });
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
         const surface = createSurface(name);
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
         // Build pi resume command
-        const parts = ["pi", "--session", shellEscape(params.sessionPath)];
+        const parts = [...(account ? account.command.map(shellEscape) : ["pi"]), "--session", shellEscape(params.sessionPath)];
 
         // Load subagent-done extension so the agent can self-terminate if needed
         const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
@@ -1828,7 +2062,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
         const resumeEnvParts: string[] = [];
-        if (process.env.PI_CODING_AGENT_DIR) {
+        if (account) {
+          resumeEnvParts.push(...Object.entries(account.env).map(([key, value]) => `${key}=${shellEscape(value)}`));
+        } else if (process.env.PI_CODING_AGENT_DIR) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
         }
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
@@ -1840,7 +2076,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
-        const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const resumeCwd = account ? `cd ${shellEscape(account.cwd)} && ` : "";
+        const command = `${resumeCwd}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -1908,7 +2145,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               return;
             }
 
-            const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
+            const allEntries = getNewEntries(resumedSessionPath, entryCountBefore);
             const summary = findLastAssistantMessage(allEntries) ??
               (result.errorMessage
                 ? `Subagent error: ${result.errorMessage}`
@@ -2036,6 +2273,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Clean summary (remove session ref and leading label for display)
         const summary = rawContent
           .replace(/\n\nSession: .+\nResume: .+$/, "")
+          .replace(/\n\nPaseo agent: .+\nResume with subagent_resume.+$/, "")
           .replace(`Sub-agent "${name}" completed (${elapsed}).\n\n`, "")
           .replace(`Sub-agent "${name}" failed (exit code ${exitCode}).\n\n`, "")
           .replace(
@@ -2055,7 +2293,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               contentLines.push(line.slice(0, width - 6));
             }
           }
-          if (details.sessionFile) {
+          if (details.paseoAgentId) {
+            contentLines.push("");
+            contentLines.push(theme.fg("dim", `Paseo agent: ${details.paseoAgentId}`));
+            contentLines.push(theme.fg("dim", `Resume: subagent_resume({ agentId: "${details.paseoAgentId}" })`));
+          } else if (details.sessionFile) {
             contentLines.push("");
             contentLines.push(theme.fg("dim", `Session: ${details.sessionFile}`));
             contentLines.push(theme.fg("dim", `Resume:  pi --session ${details.sessionFile}`));
@@ -2131,7 +2373,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (options.expanded) {
           contentLines.push("");
           contentLines.push(details.message ?? "");
-          if (details.sessionFile) {
+          if (details.paseoAgentId) {
+            contentLines.push("");
+            contentLines.push(theme.fg("dim", `Paseo agent: ${details.paseoAgentId}`));
+          } else if (details.sessionFile) {
             contentLines.push("");
             contentLines.push(theme.fg("dim", `Session: ${details.sessionFile}`));
           }
@@ -2159,7 +2404,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }
 
       // Rename workspace and tab to show this is a planning session
-      if (isMuxAvailable()) {
+      if (!usePaseo && isMuxAvailable()) {
         try {
           const label = task.length > 40 ? task.slice(0, 40) + "..." : task;
           renameWorkspace(`🎯 ${label}`);

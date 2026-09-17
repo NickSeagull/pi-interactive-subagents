@@ -1,0 +1,9 @@
+{
+  "personalAgentDir": "~/.pi/accounts/personal",
+  "companyAgentDir": "~/.pi/accounts/company",
+  "companyRoots": [
+    "~/work/company",
+    "~/src/company"
+  ],
+  "sharedConfigDir": "~/.pi/shared"
+}

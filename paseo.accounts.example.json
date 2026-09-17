@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "agents": {
+    "providers": {
+      "pi-personal": {
+        "extends": "pi",
+        "label": "Pi (Personal ChatGPT)",
+        "description": "Pi using the personal openai-codex OAuth profile",
+        "command": [
+          "/absolute/path/to/pi-interactive-subagents/bin/pi-scoped.mjs",
+          "--config",
+          "/absolute/path/to/account-policy.json",
+          "--"
+        ],
+        "env": {
+          "PI_CODING_AGENT_DIR": "/absolute/path/to/pi-personal",
+          "PI_ACCOUNT_SCOPE": "personal",
+          "PI_ACCOUNT_PROVIDER_SCOPE": "personal",
+          "PI_ACCOUNT_POLICY_FILE": "/absolute/path/to/account-policy.json",
+          "PI_ACCOUNT_LAUNCHER": "1"
+        }
+      },
+      "pi-company": {
+        "extends": "pi",
+        "label": "Pi (Company ChatGPT)",
+        "description": "Pi using the company openai-codex OAuth profile",
+        "command": [
+          "/absolute/path/to/pi-interactive-subagents/bin/pi-scoped.mjs",
+          "--config",
+          "/absolute/path/to/account-policy.json",
+          "--"
+        ],
+        "env": {
+          "PI_CODING_AGENT_DIR": "/absolute/path/to/pi-company",
+          "PI_ACCOUNT_SCOPE": "company",
+          "PI_ACCOUNT_PROVIDER_SCOPE": "company",
+          "PI_ACCOUNT_POLICY_FILE": "/absolute/path/to/account-policy.json",
+          "PI_ACCOUNT_LAUNCHER": "1"
+        }
+      }
+    }
+  }
+}

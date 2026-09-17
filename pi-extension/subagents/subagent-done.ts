@@ -6,7 +6,8 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
+import { appendFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { createSubagentActivityRecorder } from "./activity.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -75,6 +76,69 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
     .filter(Boolean);
 }
 
+/**
+ * Paseo owns the lifetime of managed Pi processes.  A terminal subagent can
+ * shut its own process down, while a Paseo child must remain available for a
+ * later prompt (and must never call ctx.shutdown()).
+ */
+function isPaseoChild(): boolean {
+  return process.env.PI_SUBAGENT_BACKEND === "paseo";
+}
+
+function clearExitSignal(sessionFile: string | undefined): void {
+  if (!sessionFile) return;
+  try {
+    unlinkSync(`${sessionFile}.exit`);
+  } catch {
+    // The sidecar is best effort. It may not exist on the first turn.
+  }
+}
+
+/**
+ * The `.exit` sidecar is a compatibility signal for older terminal
+ * watchers. Paseo children also append a durable event to a session-adjacent
+ * outbox. A follow-up can clear `.exit`, but it must never erase a completion
+ * or help request that was written while the parent was disconnected.
+ */
+function appendPaseoEvent(
+  sessionFile: string | undefined,
+  type: string,
+  payload: Record<string, unknown>,
+): void {
+  if (!isPaseoChild() || !sessionFile) return;
+  try {
+    appendFileSync(
+      `${sessionFile}.paseo-events.jsonl`,
+      `${JSON.stringify({
+        id: randomUUID(),
+        timestamp: Date.now(),
+        type,
+        payload,
+      })}\n`,
+      "utf8",
+    );
+  } catch {
+    // The compatibility sidecar and JSONL session remain available to a
+    // watcher even when the outbox cannot be written.
+  }
+}
+
+function writeExitSignal(sessionFile: string | undefined, data: object): void {
+  if (!sessionFile) return;
+  // Append before replacing the compatibility sidecar. A watcher that reacts
+  // to `.exit` can therefore read the durable event immediately.
+  if (isPaseoChild() && typeof data === "object" && data !== null) {
+    const record = data as Record<string, unknown>;
+    const { type, ...payload } = record;
+    if (typeof type === "string") appendPaseoEvent(sessionFile, type, payload);
+  }
+  try {
+    writeFileSync(`${sessionFile}.exit`, JSON.stringify(data));
+  } catch {
+    // The watcher can still recover the latest assistant message from JSONL.
+  }
+}
+
 export default function (pi: ExtensionAPI) {
   let toolNames: string[] = [];
   let denied: string[] = [];
@@ -84,13 +148,41 @@ export default function (pi: ExtensionAPI) {
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
-  const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
-  const recorder = createSubagentActivityRecorder({
+  let recorder = createSubagentActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
   });
+  let recorderChildId = process.env.PI_SUBAGENT_ID;
+  let recorderActivityFile = process.env.PI_SUBAGENT_ACTIVITY_FILE;
+  let managedCompletionSignaled = false;
 
-  function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
+  function resetManagedRecorder(startSession = true): void {
+    const childId = process.env.PI_SUBAGENT_ID;
+    const activityFile = process.env.PI_SUBAGENT_ACTIVITY_FILE;
+    const runtimeChanged = childId !== recorderChildId || activityFile !== recorderActivityFile;
+    if (!isPaseoChild() || (!managedCompletionSignaled && !runtimeChanged)) return;
+    // A managed child is deliberately reusable after done/ping. The activity
+    // recorder disables itself once it records a terminal state. A resumed
+    // delegation can also rotate child identity/activity files while the Pi
+    // process remains alive, so bind a fresh recorder to the current values.
+    recorder = createSubagentActivityRecorder({
+      runningChildId: childId,
+      activityFile,
+    });
+    recorderChildId = childId;
+    recorderActivityFile = activityFile;
+    if (startSession) recorder.sessionStart();
+    managedCompletionSignaled = false;
+  }
+
+  function renderWidget(
+    ctx: { ui?: { setWidget?: Function }; mode?: string; hasUI?: boolean },
+    _theme: any,
+  ) {
+    // RPC mode has no terminal UI. Pi supplies a no-op setWidget there, but
+    // skipping the registration also avoids constructing TUI components in a
+    // managed Paseo child.
+    if (ctx.hasUI === false || (ctx.mode && ctx.mode !== "tui") || !ctx.ui?.setWidget) return;
     ctx.ui.setWidget(
       "subagent-tools",
       (_tui: any, theme: any) => {
@@ -146,6 +238,7 @@ export default function (pi: ExtensionAPI) {
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
+    resetManagedRecorder(false);
     recorder.sessionStart();
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
@@ -155,7 +248,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("input", () => {
+    resetManagedRecorder();
     recorder.input();
+    // A completed managed child stays alive. Clear the previous completion or
+    // help sidecar before a follow-up so it cannot be mistaken for the new
+    // turn's result.
+    if (isPaseoChild()) clearExitSignal(process.env.PI_SUBAGENT_SESSION);
     // Ignore the initial task message that starts an autonomous subagent.
     // Only inputs after the first agent run has started count as user takeover.
     if (!shouldMarkUserTookOver(agentStarted)) return;
@@ -173,6 +271,14 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_end", (event, ctx) => {
     const messages = (event as any).messages as any[] | undefined;
+    // Bootstrap/resume can change this flag while the process remains alive.
+    // Read it at the end of every turn instead of capturing startup state.
+    const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
+    // Explicit caller_ping/subagent_done already emitted the terminal signal
+    // and aborted this turn. Some Pi versions still report the preceding tool
+    // call as the latest assistant message, which would otherwise look like a
+    // second successful auto-exit completion.
+    if (isPaseoChild() && managedCompletionSignaled) return;
     const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
 
     if (shouldExit) {
@@ -183,24 +289,19 @@ export default function (pi: ExtensionAPI) {
       // assistant message, mistaking the crash for a successful completion.
       const errorInfo = findLatestAssistantError(messages);
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (errorInfo && sessionFile) {
-        try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify({
-              type: "error",
-              errorMessage: errorInfo.errorMessage,
-              stopReason: errorInfo.stopReason,
-            }),
-          );
-        } catch {
-          // Best effort — even without the sidecar, watcher's session-file
-          // fallback can still recover the errorMessage.
-        }
+      if (errorInfo) {
+        writeExitSignal(sessionFile, {
+          type: "error",
+          errorMessage: errorInfo.errorMessage,
+          stopReason: errorInfo.stopReason,
+        });
+      } else if (isPaseoChild()) {
+        writeExitSignal(sessionFile, { type: "done" });
       }
 
       recorder.agentEndDone();
-      ctx.shutdown();
+      managedCompletionSignaled = isPaseoChild();
+      if (!isPaseoChild()) ctx.shutdown();
       return;
     }
 
@@ -269,9 +370,13 @@ export default function (pi: ExtensionAPI) {
     name: "caller_ping",
     label: "Caller Ping",
     description:
-      "Send a help request to the parent agent and exit this session. " +
-      "The parent will be notified with your message and can resume this session with a response. " +
-      "Use when you're stuck, need clarification, or need the parent to take action.",
+      (isPaseoChild()
+        ? "Send a help request to the parent agent and leave this managed session idle. " +
+          "The parent will be notified with your message and can resume this same session with a response. " +
+          "Use when you're stuck, need clarification, or need the parent to take action."
+        : "Send a help request to the parent agent and exit this session. " +
+          "The parent will be notified with your message and can resume this session with a response. " +
+          "Use when you're stuck, need clarification, or need the parent to take action."),
     parameters: Type.Object({
       message: Type.String({ description: "What you need help with" }),
     }),
@@ -285,16 +390,24 @@ export default function (pi: ExtensionAPI) {
       }
 
       recorder.callerPing();
+      managedCompletionSignaled = isPaseoChild();
       const exitData = {
         type: "ping" as const,
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",
         message: params.message,
       };
-      writeFileSync(`${sessionFile}.exit`, JSON.stringify(exitData));
+      writeExitSignal(sessionFile, exitData);
 
-      ctx.shutdown();
+      if (!isPaseoChild()) {
+        ctx.shutdown();
+      }
       return {
-        content: [{ type: "text", text: "Ping sent. Session will exit and parent will be notified." }],
+        content: [{
+          type: "text",
+          text: isPaseoChild()
+            ? "Ping recorded. Stop using tools and finish this turn now; the managed session will remain idle and the parent will be notified."
+            : "Ping sent. Session will exit and parent will be notified.",
+        }],
         details: {},
       };
     },
@@ -304,19 +417,29 @@ export default function (pi: ExtensionAPI) {
     name: "subagent_done",
     label: "Subagent Done",
     description:
-      "Call this tool when you have completed your task. " +
-      "It will close this session and return your results to the main session. " +
-      "Your LAST assistant message before calling this becomes the summary returned to the caller.",
+      (isPaseoChild()
+        ? "Call this tool when you have completed your task. " +
+          "It will leave this managed session idle and return your results to the main session. " +
+          "After calling it, end this turn with your final summary for the caller."
+        : "Call this tool when you have completed your task. " +
+          "It will close this session and return your results to the main session. " +
+          "Your LAST assistant message before calling this becomes the summary returned to the caller."),
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       recorder.subagentDone();
-      if (sessionFile) {
-        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+      managedCompletionSignaled = isPaseoChild();
+      writeExitSignal(sessionFile, { type: "done" });
+      if (!isPaseoChild()) {
+        ctx.shutdown();
       }
-      ctx.shutdown();
       return {
-        content: [{ type: "text", text: "Shutting down subagent session." }],
+        content: [{
+          type: "text",
+          text: isPaseoChild()
+            ? "Completion recorded. Stop using tools and finish this turn with your final summary; the managed session will remain idle for follow-up."
+            : "Shutting down subagent session.",
+        }],
         details: {},
       };
     },

@@ -26,7 +26,7 @@ subagent({ name: "Scout: DB", agent: "scout", task: "Map database schema" });
 ## Install
 
 ```bash
-pi install git:github.com/HazAT/pi-interactive-subagents
+pi install git:github.com/NickSeagull/pi-interactive-subagents
 ```
 
 Supported multiplexers:
@@ -57,6 +57,185 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500
 ```
 
 Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch commands target child surfaces by explicit ID, so focus and command delivery are independent. Note: the `interactive` option controls parent status notifications, not terminal focus.
+
+## Running Inside Paseo
+
+When the parent Pi session is managed by [Paseo](https://paseo.sh), the same
+`subagent` tools create native Pi children through Paseo's agent SDK. The
+extension selects this backend when `PASEO_AGENT_ID` is present; outside Paseo,
+the existing cmux, tmux, zellij, and WezTerm flow remains available.
+
+Native children keep the parent agent as their Paseo parent, so they appear in
+the same workspace and their completion, help, interrupt, and resume events
+remain visible from Paseo. A child that uses the parent's checkout runs in the
+same project directory. Pass `cwd` when the task belongs to another project;
+Paseo then resolves that checkout independently while preserving the parent
+relationship.
+
+Paseo mode requires a daemon with the Pi provider enabled and the
+`@getpaseo/client` 0.8.0 SDK installed by this package. It connects using the
+same daemon discovery settings as Paseo: `PASEO_HOST` or `PASEO_LISTEN`, with
+`PASEO_HOME` for an alternate daemon directory and `PASEO_PASSWORD` for an
+authenticated daemon. A Paseo child is a native managed agent and does not
+need a mux backend.
+
+```typescript
+// In a Paseo-managed parent, this creates a native Paseo child.
+subagent({
+  name: "Review API",
+  agent: "reviewer",
+  task: "Review the current API changes and report the highest-risk issue.",
+});
+
+// A child in another project keeps its own checkout and configuration.
+subagent({
+  name: "Other project",
+  cwd: "/work/other-project",
+  task: "Run the focused tests in this project and report failures.",
+});
+```
+
+The call returns immediately. Paseo owns the child process and continues to
+deliver its terminal result after a temporary connection loss. Reconnecting or
+restarting the parent restores managed children from Paseo; already-delivered
+notifications are identified by a durable delivery ID and are acknowledged
+without being sent to the parent twice. A disconnect does not terminate the
+child. Use the normal controls from either Pi or Paseo:
+
+```typescript
+subagent_interrupt({ name: "Review API" });
+subagent_resume({ agentId: "<paseo-agent-id>", message: "Please check the error path too." });
+```
+
+Paseo-backed children are Pi sessions, so agent definitions, `fork: true`,
+`session-mode`, `auto-exit`, `interactive`, tool policies, skills, and the
+`caller_ping`/`subagent_done` bootstrap behavior continue to apply. Claude Code
+definitions still use the terminal backend and are rejected when a Paseo
+parent asks for a native child.
+
+To run the optional live Paseo integration checks, start an isolated test
+daemon with a Pi provider enabled and set `PI_TEST_PASEO=1`. The harness
+creates its native parent through the SDK and accepts `PASEO_HOST` or
+`PI_TEST_PASEO_HOST` for the daemon endpoint. Set `PI_TEST_PASEO_CONTROLS=1`
+and `PI_TEST_PASEO_RECONNECT=1` to include the live interrupt and observer
+reconnect cases. The default unit suite uses a mocked SDK and does not contact
+Paseo.
+
+## Sticky ChatGPT account routing
+
+Pi stores `openai-codex` OAuth credentials in the Pi agent directory selected
+by `PI_CODING_AGENT_DIR`. This package supports two independent Pi directories:
+one for a personal ChatGPT account and one for a company account. Authenticate
+each directory independently with Pi; Codex CLI credentials are not used.
+
+Create the directories and log in with the stock Pi command. Run `/login` in
+each session and select the `openai-codex` provider:
+
+```bash
+mkdir -m 700 -p ~/.pi/accounts/personal ~/.pi/accounts/company
+PI_CODING_AGENT_DIR="$HOME/.pi/accounts/personal" pi
+# In Pi: /login, then choose openai-codex.
+PI_CODING_AGENT_DIR="$HOME/.pi/accounts/company" pi
+# In Pi: /login, then choose openai-codex for the company account.
+```
+
+Copy [account-policy.example.json](./account-policy.example.json), replace
+the example paths, and keep `personalAgentDir` and `companyAgentDir` as
+separate directories. `companyRoots` contains complete directory trees whose
+session cwd implies company scope. `sharedConfigDir` is optional and may hold
+noncredential resource directories (`extensions`, `skills`, `prompts`, and
+`themes`) that can be shared additively.
+
+Launch Pi through the dedicated wrapper so the selected profile is checked
+before stock `pi` from `PATH` starts:
+
+```bash
+node ./bin/pi-scoped.mjs \
+  --config /absolute/path/to/account-policy.json -- \
+  --model openai-codex/gpt-5.6-luna
+```
+
+The wrapper records the selected scope in the session and passes the canonical
+credential directory, policy path, scope, and launcher marker to the child
+process. A root started outside `companyRoots` can opt into company scope with
+an explicit override:
+
+```bash
+node ./bin/pi-scoped.mjs \
+  --config /absolute/path/to/account-policy.json --company -- \
+  --model openai-codex/gpt-5.6-luna
+```
+
+Scope is monotonic. A company parent keeps company scope for children and
+descendants, including children whose cwd is an open-source checkout. A
+personal parent is upgraded when a child session cwd matches a company root.
+On resume, a persisted company marker or the current cwd selects company. The
+session cwd is captured for classification; a `cd` inside a shell command does
+not change it. The selected account and reason are shown in launcher and agent
+diagnostics without displaying credentials.
+
+Use an explicit `.jsonl` Pi session path when relaunching a session. Existing
+targets need a valid Pi session header; credential/configuration files and
+hard-linked targets are rejected before they can be read or modified:
+
+```bash
+node ./bin/pi-scoped.mjs \
+  --config /absolute/path/to/account-policy.json \
+  --session /absolute/path/to/session.jsonl -- \
+  --model openai-codex/gpt-5.6-luna
+```
+
+The wrapper rejects ambiguous `--continue`/`--resume`, CLI `--fork`,
+`--no-session`, `--api-key`, API-key environment overrides, and non-
+`openai-codex` providers. Use the extension-managed fork and resume tools so
+scope metadata remains attached to the session. A running personal Pi process
+cannot replace its loaded credentials with the company store; relaunch it with
+the company override and the explicit session path. If company credentials or
+configuration are unavailable, the launch fails clearly and never falls back
+to the personal directory.
+
+Paseo does not inherit the calling Pi process's environment. Configure the
+stable `pi-personal` and `pi-company` provider aliases from
+[paseo.accounts.example.json](./paseo.accounts.example.json). Each alias
+extends Paseo's `pi` provider, invokes `pi-scoped.mjs` through an argv-array
+command, and sets its profile directory and scope markers explicitly. Paseo's
+supported `agent.create` environment handoff then carries those values to the
+Pi child even when the daemon has a different ambient environment. The
+subagent backend persists the scope, policy, selected directory, and provider
+alias in its records and labels for resume and recreation.
+Paseo does not persist per-launch environment overrides for recreation; the
+stable alias supplies the launcher and scope lower bound again, and the
+launcher rechecks the resumed session metadata and cwd.
+
+The profile helper never copies or symlinks `auth.json`, and it does not
+overwrite a profile's `settings.json`. OAuth refresh writes therefore remain
+inside the selected canonical profile directory. When `sharedConfigDir` is
+configured, only the named noncredential resource directories are linked when
+the selected profile has no directory at that path; existing profile resources
+remain authoritative.
+`sharedConfigDir/settings.json` can also initialize a missing profile settings
+file once; existing settings are never merged or overwritten.
+Pi's `AuthStorage` validates the selected
+`openai-codex` OAuth record before a launcher or Paseo child is created. This
+repository's fixture tests use synthetic files and never inspect existing
+credential contents.
+
+This policy covers the dedicated launcher and the extension's trusted terminal
+and Paseo paths. It is protection against accidental account mixing in trusted
+workflows, not a security boundary for arbitrary extensions. A direct stock Pi
+launch, an unconfigured Paseo provider or daemon API call, and an extension
+that creates its own SDK session can bypass it. The generic extension does not
+intercept every agent creation. The scope guard verifies the frozen runtime and
+reports status, while launcher/profile preflight is the fail-closed boundary;
+event-hook exceptions alone are not sufficient. Any future in-process Pi SDK
+agent or model call must pass the selected `agentDir`, `authStorage`, and
+`modelRegistry` explicitly.
+
+The live Paseo integration suite is opt-in and requires a separately
+provisioned test policy, profile, and launcher (`PI_TEST_ACCOUNT_POLICY_FILE`,
+`PI_TEST_AGENT_DIR`, and `PI_TEST_SCOPED_LAUNCHER`). It skips when those paths
+are absent. Its readiness checks inspect file metadata only; the launched Pi
+process performs its normal authentication when a live run is enabled.
 
 ## What's Included
 

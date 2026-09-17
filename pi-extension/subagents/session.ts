@@ -1,6 +1,7 @@
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
+import { readAccountSessionMetadata, persistAccountSessionScope } from "./account-session.mjs";
 
 export interface SessionEntry {
   type: string;
@@ -51,6 +52,9 @@ export function seedSubagentSessionFile(params: {
   childSessionFile: string;
   childCwd: string;
 }): void {
+  // Read before truncating fork history: the scope marker can be newer than
+  // the last user message, and lineage-only children need it too.
+  const account = readAccountSessionMetadata(params.parentSessionFile);
   const header = {
     type: "session",
     version: 3,
@@ -65,6 +69,12 @@ export function seedSubagentSessionFile(params: {
 
   mkdirSync(dirname(params.childSessionFile), { recursive: true });
   writeFileSync(params.childSessionFile, lines.join("\n") + "\n", "utf8");
+  if (account.scope) {
+    if (!account.credentialDir || !account.policyFile) throw new Error("Parent account metadata is incomplete; refusing an unscoped child");
+    persistAccountSessionScope(params.childSessionFile, {
+      scope: account.scope, credentialDir: account.credentialDir, policyFile: account.policyFile, cwd: params.childCwd,
+    });
+  }
 }
 
 function readEntries(sessionFile: string): SessionEntry[] {
